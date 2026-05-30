@@ -1,0 +1,418 @@
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Set, Optional, Tuple
+from collections import deque
+from queue import PriorityQueue
+import time
+import math
+
+
+# ==============================================================================
+# CO1: KNOWLEDGE REPRESENTATION & BUILDING GRID ENVIRONMENT STATE SPACE
+# ==============================================================================
+
+@dataclass(order=True)
+class PrioritizedNode:
+    """Helper wrapper managing deterministic tie-breaking rules in Priority Queues."""
+    priority: float
+    node_id: int = field(compare=True)
+
+
+class StructuralNode:
+    """Represents a discrete space room, corridor junction, or exit gate."""
+    def __init__(self, node_id: int, floor: int, is_exit: bool = False):
+        self.node_id = node_id
+        self.floor = floor
+        self.is_exit = is_exit
+        
+        # CSP structural capacity bounds to prevent crowd stampedes
+        self.max_occupancy_capacity = 10 if not is_exit else 1000
+        self.current_occupant_count = 0
+        
+        # Dynamic Risk Metric Fields
+        self.hazard_level = 0.0  # 0.0 (Safe Layout) to 1.0 (Blocked by Fire)
+        self.smoke_sensor_active = False
+
+    def __str__(self) -> str:
+        role = "SAFE EXIT" if self.is_exit else "Zone Corridor"
+        return (
+            f"Node {self.node_id:02d} (Floor {self.floor}) | "
+            f"Type: {role:<13} | "
+            f"Risk: {self.hazard_level * 100:>5.1f}% | "
+            f"Crowd: {self.current_occupant_count:02d}/{self.max_occupancy_capacity:02d}"
+        )
+
+
+class EvacuationPlanner:
+    """
+    PEAS Framework Realization:
+    - Performance Measure: Maximize Evacuation Speed, Minimize Path Risk, Satisfy Corridor Bottlenecks.
+    - Environment: Multi-story internal facility corridors with expanding hazard zones.
+    - Actuators: Alarm Guidance Matrices, Access Controls, Rerouting Signals.
+    - Sensors: Thermal Cameras, Optical Smoke Probes, Turnstile Registers.
+    """
+    def __init__(self):
+        self.nodes: Dict[int, StructuralNode] = {}
+        self.graph: Dict[int, List[int]] = {}
+        self.total_nodes = 48
+        self.initialize_building()
+        self.create_graph()
+
+    def initialize_building(self):
+        """Constructs physical floor layers and marks localized structural safe havens."""
+        safe_exits = {1, 12, 25, 36}  # Ground outlets and safe fire towers
+        for i in range(1, self.total_nodes + 1):
+            floor = 1 if i <= 24 else 2
+            self.nodes[i] = StructuralNode(i, floor, is_exit=(i in safe_exits))
+
+    def create_graph(self):
+        """Assembles geographic spatial layouts into explicit structural adjacency matrices."""
+        for i in range(1, self.total_nodes + 1):
+            neighbors = []
+            if i - 1 >= 1 and (i - 1) // 24 == (i - 1) // 24: 
+                neighbors.append(i - 1)
+            if i + 1 <= self.total_nodes and (i // 24 == (i - 1) // 24): 
+                neighbors.append(i + 1)
+            
+            # Fire escape stairs connecting floor 2 to floor 1 escape vectors
+            if i == 30: neighbors.append(6)
+            if i == 6: neighbors.append(30)
+            if i == 42: neighbors.append(18)
+            if i == 18: neighbors.append(42)
+            
+            self.graph[i] = neighbors
+
+    def display_building_status(self):
+        """Renders comprehensive structural state metrics."""
+        print("\n======================== ARCHITECTURAL STATUS MATRIX ========================")
+        for i, node in self.nodes.items():
+            print(node)
+            if i == 24:
+                print("-" * 77)  # Floor spatial split line
+
+    # ==============================================================================
+    # CO2: INFORMED & UNINFORMED GRAPHS PATHFINDING (BFS / DFS / A*)
+    # ==============================================================================
+
+    def bfs_search(self, start: int) -> Tuple[Optional[List[int]], int]:
+        """Uninformed breadth-first exploration to map structural exit thresholds."""
+        visited: Set[int] = set()
+        queue = deque([[start]])
+        expansions = 0
+
+        while queue:
+            path = queue.popleft()
+            curr = path[-1]
+            if curr in visited: continue
+            visited.add(curr)
+            expansions += 1
+
+            if self.nodes[curr].is_exit and self.nodes[curr].hazard_level < 0.8:
+                return path, expansions
+
+            for neighbor in self.graph[curr]:
+                if neighbor not in visited:
+                    new_path = list(path)
+                    new_path.append(neighbor)
+                    queue.append(new_path)
+        return None, expansions
+
+    def dfs_search(self, start: int) -> Tuple[Optional[List[int]], int]:
+        """Uninformed depth-first exploration mapping layout boundaries."""
+        visited: Set[int] = set()
+        stack = [[start]]
+        expansions = 0
+
+        while stack:
+            path = stack.pop()
+            curr = path[-1]
+            if curr in visited: continue
+            visited.add(curr)
+            expansions += 1
+
+            if self.nodes[curr].is_exit and self.nodes[curr].hazard_level < 0.8:
+                return path, expansions
+
+            for neighbor in reversed(self.graph[curr]):
+                if neighbor not in visited:
+                    new_path = list(path)
+                    new_path.append(neighbor)
+                    stack.append(new_path)
+        return None, expansions
+
+    def clear_path_heuristic(self, node_id: int) -> float:
+        """
+        Admissible and consistent heuristic estimating physical extraction cost.
+        Prioritizes lower floor zones to bypass upper level smoke containment ceilings.
+        """
+        return float((self.nodes[node_id].floor - 1) * 10.0)
+
+    def a_star_search(self, start: int) -> Tuple[Optional[List[int]], int]:
+        """
+        Informed graph pathfinder minimizing cumulative risk: f(n) = g(n) + h(n).
+        Guarantees cost-optimal extraction routing by dynamically penalizing unsafe paths.
+        """
+        pq = PriorityQueue()
+        pq.put(PrioritizedNode(0.0, start))
+        
+        g_costs = {i: float('inf') for i in self.nodes.keys()}
+        g_costs[start] = 0.0
+        
+        parent_map = {}
+        visited: Set[int] = set()
+        expansions = 0
+
+        while not pq.empty():
+            current_wrapper = pq.get()
+            curr = current_wrapper.node_id
+
+            if curr in visited: continue
+            visited.add(curr)
+            expansions += 1
+
+            if self.nodes[curr].is_exit and self.nodes[curr].hazard_level < 0.8:
+                path = []
+                while curr in parent_map:
+                    path.append(curr)
+                    curr = parent_map[curr]
+                path.append(start)
+                return path[::-1], expansions
+
+            for neighbor in self.graph[curr]:
+                # Dynamic Edge Weight: Base travel step (1.0) scaled up by hazard risk levels
+                hazard_penalty = self.nodes[neighbor].hazard_level * 35.0
+                tentative_g = g_costs[curr] + 1.0 + hazard_penalty
+                
+                if tentative_g < g_costs[neighbor]:
+                    g_costs[neighbor] = tentative_g
+                    f_total = tentative_g + self.clear_path_heuristic(neighbor)
+                    parent_map[neighbor] = curr
+                    pq.put(PrioritizedNode(f_total, neighbor))
+                    
+        return None, expansions
+
+    # ==============================================================================
+    # CO3: CONSTRAINT SATISFACTION PROBLEM (CSP CAPACITY ENGINE)
+    # ==============================================================================
+
+    def check_csp_constraints(self, path: List[int]) -> Tuple[bool, int, str]:
+        """
+        Validates structural domain constraints to prevent safe path bottlenecks.
+        Returns: (Is Safe, Conflicting Node ID, Diagnostic Message Text)
+        """
+        for node_id in path:
+            node = self.nodes[node_id]
+            if node.hazard_level >= 0.85:
+                return False, node_id, "CRITICAL PATH FAILURE: Route crosses direct fire vectors."
+            if node.current_occupant_count + 1 > node.max_occupancy_capacity:
+                return False, node_id, "CAPACITY FAULT: Corridor bottleneck exceeds crowd threshold limits."
+        return True, 0, "SUCCESS: Route clears all structural constraints safely."
+
+    def backcheck_and_resolve_csp(self, start: int, target_group_size: int) -> Optional[List[int]]:
+        """
+        Chronological backtracking routine serving as a backup option if primary routes fail.
+        Finds the closest constraint-compliant path to an exit.
+        """
+        frontier = deque([[start]])
+        while frontier:
+            path = frontier.popleft()
+            curr = path[-1]
+            
+            if len(path) > 15: continue  # Depth cut-off constraint to bound rationality
+            
+            if self.nodes[curr].is_exit:
+                # Validate the complete path against current crowd limits
+                is_valid = True
+                for step in path:
+                    if self.nodes[step].current_occupant_count + target_group_size > self.nodes[step].max_occupancy_capacity:
+                        is_valid = False
+                        break
+                if is_valid: return path
+
+            for neighbor in self.graph[curr]:
+                if neighbor not in path and self.nodes[neighbor].hazard_level < 0.6:
+                    new_path = list(path)
+                    new_path.append(neighbor)
+                    frontier.append(new_path)
+        return None
+
+    # ==============================================================================
+    # CO4: VALUE-BOUNDED UTILITY THEORY (DECISION ARRAYS)
+    # ==============================================================================
+
+    def compute_path_utility(self, path: List[int]) -> float:
+        """
+        Evaluates Multi-Attribute Utility metrics out of a maximum score of 100.
+        Attributes: Path Length (Weight=40%), Cumulative Hazard Risk (Weight=60%).
+        """
+        if not path: return 0.0
+        
+        total_risk = sum(self.nodes[step].hazard_level for step in path)
+        avg_risk = total_risk / len(path)
+        path_length_penalty = len(path) * 1.5
+        
+        utility_score = 100.0 - (avg_risk * 60.0) - path_length_penalty
+        return max(0.0, min(100.0, utility_score))
+
+    # ==============================================================================
+    # CO5: BAYESIAN INFERENCE PIPELINE (THREAT ANALYSIS)
+    # ==============================================================================
+
+    def evaluate_bayesian_threat_spread(self, node_id: int) -> float:
+        """
+        Computes conditional posterior risk assessments using Bayes' Rule.
+        Calculates: P(Zone Blocked | Smoke Sensor Active)
+        """
+        # Prior Probabilities
+        p_blocked = 0.15          # Base probability of structural blockage during an emergency
+        p_clear = 1.0 - p_blocked # Complementary safe baseline condition
+        
+        # Sensor Likelihood Matrix (Conditional Probability Tables)
+        p_smoke_given_blocked = 0.92  # True Positive Rate
+        p_smoke_given_clear = 0.22    # False Positive Rate due to dust/ambient vapor disturbances
+        
+        # Total Probability Theorem (Marginalization)
+        p_smoke_total = (p_smoke_given_blocked * p_blocked) + (p_smoke_given_clear * p_clear)
+        
+        # Bayesian Conditional Update Calculation
+        p_blocked_given_smoke = (p_smoke_given_blocked * p_blocked) / p_smoke_total
+        return p_blocked_given_smoke
+
+    # ==============================================================================
+    # CO6: HYBRID ALLOCATION ROUTINE & PERFORMANCE CRITIQUE
+    # ==============================================================================
+
+    def dispatch_emergency_routing(self, group_id: str, start_node: int, size: int):
+        """Fuses Search optimization + CSP validation + Utility Ranking cascades."""
+        print(f"\n[ALARM REROUTER TRACE] Processing clearance paths for: {group_id} | Size: {size}")
+        
+        # Step 1: Execute Informed Optimal Graph Traversal
+        optimal_path, nodes_expanded = self.a_star_search(start_node)
+        print(f"[ALARM REROUTER TRACE] Informed pathfinder complete. A* expanded {nodes_expanded} nodes.")
+
+        # Step 2: CSP Validation Filtering & Backtracking Fallback Routing
+        if optimal_path:
+            is_safe, fault_node, diagnostic_msg = self.check_csp_constraints(optimal_path)
+            print(f"[ALARM REROUTER TRACE] Primary Route Check at Node {fault_node if fault_node else 'None'}: {diagnostic_msg}")
+        else:
+            is_safe, optimal_path = False, None
+
+        # Fallback Strategy: If search candidate violates constraints, trigger CSP backcheck
+        if not is_safe:
+            print("[ALARM REROUTER TRACE] Structural constraints breached. Activating CSP fallback routing loop...")
+            optimal_path = self.backcheck_and_resolve_csp(start_node, size)
+
+        # Step 3: Allocation Verification Finalization
+        if not optimal_path:
+            print(f"[-] CRITICAL FAILURE: Group {group_id} is completely trapped. No structurally compliant exit routes found.")
+            return
+
+        # Commit State Mutations to mirror structural changes in the building environment
+        for node_id in optimal_path:
+            self.nodes[node_id].current_occupant_count += size
+
+        final_utility = self.compute_path_utility(optimal_path)
+
+        print("\n======================= EXTRACTION TARGET CLEARANCE =======================")
+        print(f" Group Identity Reference: {group_id}")
+        print(f" Assigned Safe Evac Path : {' -> '.join(map(str, optimal_path))}")
+        print(f" Quantified Path Utility : {final_utility:.2f} / 100.00 PTS")
+        print(f" Structural Status Code  : Clear to Proceed. Dynamic Markers Deployed.")
+        print("===========================================================================")
+
+    def clear_safe_extraction(self, path_sequence: List[int], size: int):
+        """Reclaims structural tracking parameters once an evacuee group safely clears a zone."""
+        for node_id in path_sequence:
+            if node_id in self.nodes:
+                self.nodes[node_id].current_occupant_count = max(0, self.nodes[node_id].current_occupant_count - size)
+
+
+# ==============================================================================
+# MAIN PROGRAM CENTRAL INTERACTIVE INTERFACE
+# ==============================================================================
+
+if __name__ == "__main__":
+    engine = EvacuationPlanner()
+
+    # Pre-populate hazards to simulate an active, unfolding building fire incident
+    engine.nodes[4].hazard_level = 0.95   # Central corridor blocked by active flames
+    engine.nodes[5].hazard_level = 0.60   # Smoke venting into structural passage 5
+    engine.nodes[30].hazard_level = 0.40  # Staircase landing 30 showing elevated heat metrics
+    
+    # Pre-populate crowd density metrics to simulate an active bottleneck constraint hazard
+    engine.nodes[2].current_occupant_count = 10  # Node 2 is currently at maximum capacity bounds
+
+    while True:
+        print("\n================ CENTRAL INCIDENT COMMAND CONSOLE ================")
+        print("1. Render Current Environmental Layout State Map")
+        print("2. Dispatch Intelligent Evacuation Sequence (Hybrid AI System)")
+        print("3. Execute Bayesian Sensor Predictive Threat Inspection Pipeline")
+        print("4. Benchmark Uninformed Search Agent Node Expansions (BFS vs DFS)")
+        print("5. Inject Dynamic Fire/Smoke Hazard Sensor Telemetry Values")
+        print("6. Terminate Operational Emergency Application System Thread")
+        
+        choice = input("\nEnter Target Command Directive Index [1-6]: ").strip()
+
+        if choice == '1':
+            engine.display_building_status()
+            
+        elif choice == '2':
+            g_id = input("Provide Outbound Civilian Group Reference Tag: ").strip()
+            try:
+                g_start = int(input("Provide Initial Incident Entry Point Node ID [1-48]: "))
+                g_size = int(input("Provide Total Occupant Count in Crowd Group: "))
+            except ValueError:
+                print("[-] Validation Error: Input must match numerical system indices.")
+                continue
+            if g_start in engine.nodes:
+                engine.dispatch_emergency_routing(g_id, g_start, g_size)
+            else:
+                print("[-] Operational Error: Target coordinates are out of bounds.")
+                
+        elif choice == '3':
+            try:
+                t_node = int(input("Target Node to Run Bayesian Analysis on [1-48]: "))
+            except ValueError:
+                print("[-] Validation Error: Input must match numerical system indices.")
+                continue
+            if t_node in engine.nodes:
+                prob = engine.evaluate_bayesian_threat_spread(t_node)
+                print(f"\n=================== BAYES ESTIMATOR REPORT ===================")
+                print(f" Target Checking Coordinates : Node {t_node}")
+                print(f" Conditional Posterior Metric: P(Blocked | Smoke Probe) = {prob * 100:.2f}%")
+                print(f" Risk Status Flag            : {'HIGH RISK' if prob > 0.5 else 'NORMAL WARNING'}")
+                print("==============================================================")
+                
+        elif choice == '4':
+            try:
+                b_start = int(input("Provide Benchmarking Starting Point Node ID [1-48]: "))
+            except ValueError:
+                print("[-] Validation Error: Input must match numerical system indices.")
+                continue
+            if b_start in engine.nodes:
+                _, bfs_nodes = engine.bfs_search(b_start)
+                _, dfs_nodes = engine.dfs_search(b_start)
+                print(f"\n================ EMPIRICAL AGENT EVALUATION ================")
+                print(f" Uninformed Agent [Breadth-First Search] Nodes Expanded: {bfs_nodes}")
+                print(f" Uninformed Agent [Depth-First Search]   Nodes Expanded: {dfs_nodes}")
+                print(" Execution Note: Lower expansions minimize space complexity curves.")
+                print("============================================================")
+                
+        elif choice == '5':
+            try:
+                h_node = int(input("Target Structural Node Coordinate Index [1-48]: "))
+                h_val = float(input("Target Hazard Intensity Parameter Value [0.0 - 1.0]: "))
+            except ValueError:
+                print("[-] Validation Error: Input values must match format structures.")
+                continue
+            if h_node in engine.nodes and (0.0 <= h_val <= 1.0):
+                engine.nodes[h_node].hazard_level = h_val
+                print(f"[SUCCESS] Injected change vector: Node {h_node} hazard level updated to {h_val*100:.1f}%")
+            else:
+                print("[-] Operational Exception: Provided input values are out of bounds.")
+                
+        elif choice == '6':
+            print("\n[ALERT] Shutting down core emergency command modules... Thread Terminated.")
+            break
+        else:
+            print("\n[-] Operational Exception: Unknown instruction directive index choice.")
